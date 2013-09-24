@@ -10,14 +10,14 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2011 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @private
 -module(amqp_connection_type_sup).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
 -behaviour(supervisor2).
 

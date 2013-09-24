@@ -10,23 +10,23 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2011 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @private
 -module(amqp_network_connection).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
 -behaviour(amqp_gen_connection).
-
 -export([init/1, terminate/2, connect/4, do/2, open_channel_args/1, i/2,
          info_keys/0, handle_message/2, closing/3, channels_terminated/1]).
 
 -define(RABBIT_TCP_OPTS, [binary, {packet, 0}, {active,false}, {nodelay, true}]).
 -define(SOCKET_CLOSING_TIMEOUT, 1000).
 -define(HANDSHAKE_RECEIVE_TIMEOUT, 60000).
+-define(TCP_MAX_PACKET_SIZE, (16#4000000 + ?EMPTY_FRAME_SIZE - 1)).
 
 -record(state, {sock,
                 heartbeat,
@@ -42,8 +42,8 @@
 init([]) ->
     {ok, #state{}}.
 
-open_channel_args(#state{sock = Sock}) ->
-    [Sock].
+open_channel_args(#state{sock = Sock, frame_max = FrameMax}) ->
+    [Sock, FrameMax].
 
 do(#'connection.close_ok'{} = CloseOk, State) ->
     erlang:send_after(?SOCKET_CLOSING_TIMEOUT, self(), socket_closing_timeout),
@@ -52,7 +52,7 @@ do(Method, State) ->
     do2(Method, State).
 
 do2(Method, #state{writer0 = Writer}) ->
-    %% Catching because it expects the {channel_exit, _} message on error
+    %% Catching because it expects the {channel_exit, _, _} message on error
     catch rabbit_writer:send_command_sync(Writer, Method).
 
 handle_message(socket_closing_timeout,
@@ -65,10 +65,22 @@ handle_message(socket_closed, State = #state{waiting_socket_close = false}) ->
     {stop, socket_closed_unexpectedly, State};
 handle_message({socket_error, _} = SocketError, State) ->
     {stop, SocketError, State};
-handle_message({channel_exit, Reason}, State) ->
+handle_message({channel_exit, 0, Reason}, State) ->
     {stop, {channel0_died, Reason}, State};
 handle_message(heartbeat_timeout, State) ->
-    {stop, heartbeat_timeout, State}.
+    {stop, heartbeat_timeout, State};
+handle_message(closing_timeout, State = #state{closing_reason = Reason}) ->
+    {stop, Reason, State};
+%% see http://erlang.org/pipermail/erlang-bugs/2012-June/002933.html
+handle_message({Ref, {error, Reason}},
+               State = #state{waiting_socket_close = Waiting,
+                              closing_reason       = CloseReason})
+  when is_reference(Ref) ->
+    {stop, case {Reason, Waiting} of
+               {closed,  true} -> {shutdown, CloseReason};
+               {closed, false} -> socket_closed_unexpectedly;
+               {_,          _} -> {socket_error, Reason}
+           end, State}.
 
 closing(_ChannelCloseType, Reason, State) ->
     {ok, State#state{closing_reason = Reason}}.
@@ -107,6 +119,7 @@ do_connect({Addr, Family},
                                              connection_timeout = Timeout,
                                              socket_options     = ExtraOpts},
            SIF, ChMgr, State) ->
+    obtain(),
     case gen_tcp:connect(Addr, Port,
                          [Family | ?RABBIT_TCP_OPTS] ++ ExtraOpts,
                          Timeout) of
@@ -120,7 +133,8 @@ do_connect({Addr, Family},
                                              connection_timeout = Timeout,
                                              socket_options     = ExtraOpts},
            SIF, ChMgr, State) ->
-    rabbit_misc:start_applications([crypto, public_key, ssl]),
+    app_utils:start_applications([crypto, public_key, ssl]),
+    obtain(),
     case gen_tcp:connect(Addr, Port,
                          [Family | ?RABBIT_TCP_OPTS] ++ ExtraOpts,
                          Timeout) of
@@ -137,9 +151,15 @@ do_connect({Addr, Family},
             E
     end.
 
+inet_address_preference() ->
+    case application:get_env(amqp_client, prefer_ipv6) of
+        {ok, true}  -> [inet6, inet];
+        {ok, false} -> [inet, inet6]
+    end.
+
 gethostaddr(Host) ->
     Lookups = [{Family, inet:getaddr(Host, Family)}
-               || Family <- [inet, inet6]],
+               || Family <- inet_address_preference()],
     [{IP, Family} || {Family, {ok, IP}} <- Lookups].
 
 try_handshake(AmqpParams, SIF, ChMgr, State) ->
@@ -195,12 +215,21 @@ tune(#'connection.tune'{channel_max = ServerChannelMax,
                               lists:max([Client, Server]);
                           (Client, Server) ->
                               lists:min([Client, Server])
-                      end, [ClientChannelMax, ClientHeartbeat, ClientFrameMax],
-                           [ServerChannelMax, ServerHeartbeat, ServerFrameMax]),
-    NewState = State#state{heartbeat = Heartbeat, frame_max = FrameMax},
+                      end,
+                      [ClientChannelMax, ClientHeartbeat, ClientFrameMax],
+                      [ServerChannelMax, ServerHeartbeat, ServerFrameMax]),
+    %% If we attempt to recv > 64Mb, inet_drv will return enomem, so
+    %% we cap the max negotiated frame size accordingly. Note that
+    %% since we receive the frame header separately, we can actually
+    %% cope with frame sizes of 64M + ?EMPTY_FRAME_SIZE - 1.
+    CappedFrameMax = case FrameMax of
+                         0 -> ?TCP_MAX_PACKET_SIZE;
+                         _ -> lists:min([FrameMax, ?TCP_MAX_PACKET_SIZE])
+                     end,
+    NewState = State#state{heartbeat = Heartbeat, frame_max = CappedFrameMax},
     start_heartbeat(SHF, NewState),
     {#'connection.tune_ok'{channel_max = ChannelMax,
-                           frame_max   = FrameMax,
+                           frame_max   = CappedFrameMax,
                            heartbeat   = Heartbeat}, ChannelMax, NewState}.
 
 start_heartbeat(SHF, #state{sock = Sock, heartbeat = Heartbeat}) ->
@@ -245,7 +274,7 @@ client_properties(UserProperties) ->
                {<<"version">>,   longstr, list_to_binary(Vsn)},
                {<<"platform">>,  longstr, <<"Erlang">>},
                {<<"copyright">>, longstr,
-                <<"Copyright (c) 2007-2011 VMware, Inc.">>},
+                <<"Copyright (c) 2007-2013 GoPivotal, Inc.">>},
                {<<"information">>, longstr,
                 <<"Licensed under the MPL.  "
                   "See http://www.rabbitmq.com/">>},
@@ -256,9 +285,11 @@ client_properties(UserProperties) ->
 
 handshake_recv(Expecting) ->
     receive
-        {'$gen_cast', {method, Method, none}} ->
+        {'$gen_cast', {method, Method, none, noflow}} ->
             case {Expecting, element(1, Method)} of
                 {E, M} when E =:= M ->
+                    Method;
+                {'connection.tune', 'connection.secure'} ->
                     Method;
                 {'connection.open_ok', _} ->
                     {closing,
@@ -280,6 +311,10 @@ handshake_recv(Expecting) ->
             end;
         {socket_error, _} = SocketError ->
             exit({SocketError, {expecting, Expecting}});
+        {refused, Version} ->
+            exit({server_refused_connection, Version});
+        {malformed_header, All} ->
+            exit({server_sent_malformed_header, All});
         heartbeat_timeout ->
             exit(heartbeat_timeout);
         Other ->
@@ -295,4 +330,10 @@ handshake_recv(Expecting) ->
             _ ->
                 exit(handshake_receive_timed_out)
         end
+    end.
+
+obtain() ->
+    case code:is_loaded(file_handle_cache) of
+        false -> ok;
+        _     -> file_handle_cache:obtain()
     end.

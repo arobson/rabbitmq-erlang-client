@@ -10,12 +10,13 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2011-2011 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2011-2013 GoPivotal, Inc.  All rights reserved.
 %%
 
 -include("amqp_client.hrl").
 
+-ifndef(edoc).
 -type(state() :: any()).
 -type(consume() :: #'basic.consume'{}).
 -type(consume_ok() :: #'basic.consume_ok'{}).
@@ -38,3 +39,4 @@
                            {reply, any(), state()} | {noreply, state()} |
                             {error, reason(), state()}).
 -spec(terminate/2 :: (any(), state()) -> state()).
+-endif.

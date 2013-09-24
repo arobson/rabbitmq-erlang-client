@@ -10,14 +10,14 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2011 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2011-2013 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(test_util).
 
 -include_lib("eunit/include/eunit.hrl").
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
 -compile([export_all]).
 
@@ -140,6 +140,93 @@ amqp_uri_parse_test() ->
 
     ok.
 
+%%--------------------------------------------------------------------
+%% Destination Parsing Tests
+%%--------------------------------------------------------------------
+
+route_destination_test() ->
+    %% valid queue
+    ?assertMatch({ok, {queue, "test"}}, parse_dest("/queue/test")),
+
+    %% valid topic
+    ?assertMatch({ok, {topic, "test"}}, parse_dest("/topic/test")),
+
+    %% valid exchange
+    ?assertMatch({ok, {exchange, {"test", undefined}}}, parse_dest("/exchange/test")),
+
+    %% valid temp queue
+    ?assertMatch({ok, {temp_queue, "test"}}, parse_dest("/temp-queue/test")),
+
+    %% valid reply queue
+    ?assertMatch({ok, {reply_queue, "test"}}, parse_dest("/reply-queue/test")),
+    ?assertMatch({ok, {reply_queue, "test/2"}}, parse_dest("/reply-queue/test/2")),
+
+    %% valid exchange with pattern
+    ?assertMatch({ok, {exchange, {"test", "pattern"}}},
+        parse_dest("/exchange/test/pattern")),
+
+    %% valid pre-declared queue
+    ?assertMatch({ok, {amqqueue, "test"}}, parse_dest("/amq/queue/test")),
+
+    %% queue without name
+    ?assertMatch({error, {invalid_destination, queue, ""}}, parse_dest("/queue")),
+    ?assertMatch({ok, {queue, undefined}}, parse_dest("/queue", true)),
+
+    %% topic without name
+    ?assertMatch({error, {invalid_destination, topic, ""}}, parse_dest("/topic")),
+
+    %% exchange without name
+    ?assertMatch({error, {invalid_destination, exchange, ""}},
+        parse_dest("/exchange")),
+
+    %% exchange default name
+    ?assertMatch({error, {invalid_destination, exchange, "//foo"}},
+        parse_dest("/exchange//foo")),
+
+    %% amqqueue without name
+    ?assertMatch({error, {invalid_destination, amqqueue, ""}},
+        parse_dest("/amq/queue")),
+
+    %% queue without name with trailing slash
+    ?assertMatch({error, {invalid_destination, queue, "/"}}, parse_dest("/queue/")),
+
+    %% topic without name with trailing slash
+    ?assertMatch({error, {invalid_destination, topic, "/"}}, parse_dest("/topic/")),
+
+    %% exchange without name with trailing slash
+    ?assertMatch({error, {invalid_destination, exchange, "/"}},
+        parse_dest("/exchange/")),
+
+    %% queue with invalid name
+    ?assertMatch({error, {invalid_destination, queue, "/foo/bar"}},
+        parse_dest("/queue/foo/bar")),
+
+    %% topic with invalid name
+    ?assertMatch({error, {invalid_destination, topic, "/foo/bar"}},
+        parse_dest("/topic/foo/bar")),
+
+    %% exchange with invalid name
+    ?assertMatch({error, {invalid_destination, exchange, "/foo/bar/baz"}},
+        parse_dest("/exchange/foo/bar/baz")),
+
+    %% unknown destination
+    ?assertMatch({error, {unknown_destination, "/blah/boo"}},
+        parse_dest("/blah/boo")),
+
+    %% queue with escaped name
+    ?assertMatch({ok, {queue, "te/st"}}, parse_dest("/queue/te%2Fst")),
+
+    %% valid exchange with escaped name and pattern
+    ?assertMatch({ok, {exchange, {"te/st", "pa/tt/ern"}}},
+        parse_dest("/exchange/te%2Fst/pa%2Ftt%2Fern")),
+
+    ok.
+
+parse_dest(Destination, Params) ->
+    rabbit_routing_util:parse_endpoint(Destination, Params).
+parse_dest(Destination) ->
+    rabbit_routing_util:parse_endpoint(Destination).
+
 %%%%
 %%
 %% This is an example of how the client interaction should work
@@ -165,6 +252,11 @@ lifecycle_test() ->
     amqp_channel:call(Channel, #'exchange.delete'{exchange = X}),
     teardown(Connection, Channel),
     ok.
+
+direct_no_password_test() ->
+    {ok, Connection} = new_connection(just_direct, [{password, none}]),
+    amqp_connection:close(Connection),
+    wait_for_death(Connection).
 
 queue_exchange_binding(Channel, X, Parent, Tag) ->
     receive
@@ -368,11 +460,23 @@ basic_return_test() ->
             ?assertMatch(?NO_ROUTE, ReplyCode),
             #amqp_msg{payload = Payload2} = Content,
             ?assertMatch(Payload, Payload2);
-        WhatsThis ->
-            exit({bad_message, WhatsThis})
+        WhatsThis1 ->
+            exit({bad_message, WhatsThis1})
     after 2000 ->
         exit(no_return_received)
     end,
+    amqp_channel:unregister_return_handler(Channel),
+    Publish = #'basic.publish'{exchange = X, routing_key = Key,
+                               mandatory = true},
+    amqp_channel:call(Channel, Publish, #amqp_msg{payload = Payload}),
+    ok = receive
+             {_BasicReturn = #'basic.return'{}, _Content} ->
+                 unexpected_return;
+             WhatsThis2 ->
+                 exit({bad_message, WhatsThis2})
+         after 2000 ->
+                 ok
+         end,
     teardown(Connection, Channel).
 
 channel_repeat_open_close_test() ->
@@ -623,14 +727,43 @@ confirm_barrier_test() ->
     true = amqp_channel:wait_for_confirms(Channel),
     teardown(Connection, Channel).
 
-confirm_barrier_nop_test() ->
+confirm_select_before_wait_test() ->
     {ok, Connection} = new_connection(),
     {ok, Channel} = amqp_connection:open_channel(Connection),
-    true = amqp_channel:wait_for_confirms(Channel),
-    amqp_channel:call(Channel, #'basic.publish'{routing_key = <<"whoosh">>},
-                      #amqp_msg{payload = <<"foo">>}),
-    true = amqp_channel:wait_for_confirms(Channel),
+    try amqp_channel:wait_for_confirms(Channel) of
+        _ -> exit(success_despite_lack_of_confirm_mode)
+    catch
+        not_in_confirm_mode -> ok
+    end,
     teardown(Connection, Channel).
+
+confirm_barrier_timeout_test() ->
+    {ok, Connection} = new_connection(),
+    {ok, Channel} = amqp_connection:open_channel(Connection),
+    #'confirm.select_ok'{} = amqp_channel:call(Channel, #'confirm.select'{}),
+    [amqp_channel:call(Channel, #'basic.publish'{routing_key = <<"whoosh">>},
+                       #amqp_msg{payload = <<"foo">>})
+     || _ <- lists:seq(1, 1000)],
+    case amqp_channel:wait_for_confirms(Channel, 0) of
+        true    -> ok;
+        timeout -> ok
+    end,
+    teardown(Connection, Channel).
+
+confirm_barrier_die_timeout_test() ->
+    {ok, Connection} = new_connection(),
+    {ok, Channel} = amqp_connection:open_channel(Connection),
+    #'confirm.select_ok'{} = amqp_channel:call(Channel, #'confirm.select'{}),
+    [amqp_channel:call(Channel, #'basic.publish'{routing_key = <<"whoosh">>},
+                       #amqp_msg{payload = <<"foo">>})
+     || _ <- lists:seq(1, 1000)],
+    try amqp_channel:wait_for_confirms_or_die(Channel, 0) of
+        true    -> ok
+    catch
+        exit:timeout -> ok
+    end,
+    amqp_connection:close(Connection),
+    wait_for_death(Connection).
 
 default_consumer_test() ->
     {ok, Connection} = new_connection(),
@@ -665,21 +798,26 @@ default_consumer_test() ->
     teardown(Connection, Channel).
 
 subscribe_nowait_test() ->
-    {ok, Connection} = new_connection(),
-    {ok, Channel} = amqp_connection:open_channel(Connection),
-    {ok, Q} = setup_publish(Channel),
-    ok = amqp_channel:call(Channel,
-                           #'basic.consume'{queue = Q,
-                                            consumer_tag = uuid(),
-                                            nowait = true}),
-    receive #'basic.consume_ok'{} -> exit(unexpected_consume_ok)
-    after 0 -> ok
-    end,
+    {ok, Conn} = new_connection(),
+    {ok, Ch} = amqp_connection:open_channel(Conn),
+    {ok, Q} = setup_publish(Ch),
+    CTag = uuid(),
+    amqp_selective_consumer:register_default_consumer(Ch, self()),
+    ok = amqp_channel:call(Ch, #'basic.consume'{queue        = Q,
+                                                consumer_tag = CTag,
+                                                nowait       = true}),
+    ok = amqp_channel:call(Ch, #'basic.cancel' {consumer_tag = CTag,
+                                                nowait       = true}),
+    ok = amqp_channel:call(Ch, #'basic.consume'{queue        = Q,
+                                                consumer_tag = CTag,
+                                                nowait       = true}),
     receive
+        #'basic.consume_ok'{} ->
+            exit(unexpected_consume_ok);
         {#'basic.deliver'{delivery_tag = DTag}, _Content} ->
-            amqp_channel:cast(Channel, #'basic.ack'{delivery_tag = DTag})
+            amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DTag})
     end,
-    teardown(Connection, Channel).
+    teardown(Conn, Ch).
 
 basic_nack_test() ->
     {ok, Connection} = new_connection(),
@@ -770,55 +908,6 @@ pc_consumer_loop(Channel, Payload, NReceived) ->
         NReceived
     end.
 
-
-%%----------------------------------------------------------------------------
-%% Unit test for the direct client
-%% This just relies on the fact that a fresh Rabbit VM must consume more than
-%% 0.1 pc of the system memory:
-%% 0. Wait 1 minute to let memsup do stuff
-%% 1. Make sure that the high watermark is set high
-%% 2. Start a process to receive the pause and resume commands from the broker
-%% 3. Register this as flow control notification handler
-%% 4. Let the system settle for a little bit
-%% 5. Set the threshold to the lowest possible value
-%% 6. When the flow handler receives the pause command, it sets the watermark
-%%    to a high value in order to get the broker to send the resume command
-%% 7. Allow 10 secs to receive the pause and resume, otherwise timeout and
-%%    fail
-channel_flow_test() ->
-    {ok, Connection} = new_connection(),
-    X = <<"amq.direct">>,
-    K = Payload = <<"x">>,
-    memsup:set_sysmem_high_watermark(0.99),
-    timer:sleep(1000),
-    {ok, Channel} = amqp_connection:open_channel(Connection),
-    Parent = self(),
-    Child = spawn_link(
-              fun() ->
-                      receive
-                          #'channel.flow'{active = false} -> ok
-                      end,
-                      Publish = #'basic.publish'{exchange = X,
-                                                 routing_key = K},
-                      blocked =
-                        amqp_channel:call(Channel, Publish,
-                                          #amqp_msg{payload = Payload}),
-                      memsup:set_sysmem_high_watermark(0.99),
-                      receive
-                          #'channel.flow'{active = true} -> ok
-                      end,
-                      Parent ! ok
-              end),
-    amqp_channel:register_flow_handler(Channel, Child),
-    timer:sleep(1000),
-    memsup:set_sysmem_high_watermark(0.001),
-    receive
-        ok -> ok
-    after 10000 ->
-        ?LOG_DEBUG("Are you sure that you have waited 1 minute?~n"),
-        exit(did_not_receive_channel_flow)
-    end.
-
 %%---------------------------------------------------------------------------
 %% This tests whether RPC over AMQP produces the same result as invoking the
 %% same argument against the same underlying gen_server instance.
@@ -839,6 +928,108 @@ rpc_test() ->
     amqp_connection:close(Connection),
     wait_for_death(Connection),
     ok.
+
+%% This tests if the RPC continues to generate valid correlation ids
+%% over a series of requests.
+rpc_client_test() ->
+    {ok, Connection} = new_connection(),
+    {ok, Channel} = amqp_connection:open_channel(Connection),
+    Q = uuid(),
+    Latch = 255, % enough requests to tickle bad correlation ids
+    %% Start a server to return correlation ids to the client.
+    Server = spawn_link(fun() ->
+                                rpc_correlation_server(Channel, Q)
+                        end),
+    %% Generate a series of RPC requests on the same client.
+    Client = amqp_rpc_client:start(Connection, Q),
+    Parent = self(),
+    [spawn(fun() ->
+                   Reply = amqp_rpc_client:call(Client, <<>>),
+                   Parent ! {finished, Reply}
+           end) || _ <- lists:seq(1, Latch)],
+    %% Verify that the correlation ids are valid UTF-8 strings.
+    CorrelationIds = latch_loop(Latch),
+    [?assertMatch(<<_/binary>>, DecodedId)
+     || DecodedId <- [unicode:characters_to_binary(Id, utf8)
+                      || Id <- CorrelationIds]],
+    %% Cleanup.
+    Server ! stop,
+    amqp_rpc_client:stop(Client),
+    teardown(Connection, Channel),
+    ok.
+
+%% Consumer of RPC requests that replies with the CorrelationId.
+rpc_correlation_server(Channel, Q) ->
+    amqp_channel:register_return_handler(Channel, self()),
+    amqp_channel:call(Channel, #'queue.declare'{queue = Q}),
+    amqp_channel:call(Channel, #'basic.consume'{queue = Q}),
+    rpc_client_consume_loop(Channel),
+    amqp_channel:unregister_return_handler(Channel).
+
+rpc_client_consume_loop(Channel) ->
+    receive
+        stop ->
+            ok;
+        {#'basic.deliver'{delivery_tag = DeliveryTag},
+         #amqp_msg{props = Props}} ->
+            #'P_basic'{correlation_id = CorrelationId,
+                       reply_to = Q} = Props,
+            Properties = #'P_basic'{correlation_id = CorrelationId},
+            Publish = #'basic.publish'{exchange = <<>>,
+                                       routing_key = Q,
+                                       mandatory = true},
+            amqp_channel:call(
+              Channel, Publish, #amqp_msg{props = Properties,
+                                          payload = CorrelationId}),
+            amqp_channel:call(
+              Channel, #'basic.ack'{delivery_tag = DeliveryTag}),
+            rpc_client_consume_loop(Channel);
+        _ ->
+            rpc_client_consume_loop(Channel)
+    after 3000 ->
+            exit(no_request_received)
+    end.
+
+%%---------------------------------------------------------------------------
+
+%% connection.blocked, connection.unblocked
+
+connection_blocked_network_test() ->
+    {ok, Connection} = new_connection(just_network),
+    X = <<"amq.direct">>,
+    K = Payload = <<"x">>,
+    clear_resource_alarm(memory),
+    timer:sleep(1000),
+    {ok, Channel} = amqp_connection:open_channel(Connection),
+    Parent = self(),
+    Child = spawn_link(
+              fun() ->
+                      receive
+                          #'connection.blocked'{} -> ok
+                      end,
+                      clear_resource_alarm(memory),
+                      receive
+                          #'connection.unblocked'{} -> ok
+                      end,
+                      Parent ! ok
+              end),
+    amqp_connection:register_blocked_handler(Connection, Child),
+    set_resource_alarm(memory),
+    Publish = #'basic.publish'{exchange = X,
+                               routing_key = K},
+    amqp_channel:call(Channel, Publish,
+                      #amqp_msg{payload = Payload}),
+    timer:sleep(1000),
+    receive
+        ok ->
+            clear_resource_alarm(memory),
+            clear_resource_alarm(disk),
+            ok
+    after 10000 ->
+        clear_resource_alarm(memory),
+        clear_resource_alarm(disk),
+        exit(did_not_receive_connection_blocked)
+    end.
 
 %%---------------------------------------------------------------------------
 
@@ -939,7 +1130,7 @@ new_connection(AllowedConnectionTypes, Params) ->
                                   {verify, verify_peer},
                                   {fail_if_no_peer_cert, true}]}] ++ Params);
             {_, "direct"} ->
-                make_direct_params([{node, rabbit_misc:makenode(rabbit)}] ++
+                make_direct_params([{node, rabbit_nodes:make(rabbit)}] ++
                                        Params)
         end,
     amqp_connection:start(Params1).
@@ -962,5 +1153,17 @@ make_direct_params(Props) ->
                   proplists:get_value(Key, Props, Default)
           end,
     #amqp_params_direct{username     = Pgv(username, <<"guest">>),
+                        password     = Pgv(password, <<"guest">>),
                         virtual_host = Pgv(virtual_host, <<"/">>),
                         node         = Pgv(node, node())}.
+
+set_resource_alarm(memory) ->
+    os:cmd("cd ../rabbitmq-test; make set-resource-alarm SOURCE=memory");
+set_resource_alarm(disk) ->
+    os:cmd("cd ../rabbitmq-test; make set-resource-alarm SOURCE=disk").
+
+
+clear_resource_alarm(memory) ->
+    os:cmd("cd ../rabbitmq-test; make clear-resource-alarm SOURCE=memory");
+clear_resource_alarm(disk) ->
+    os:cmd("cd ../rabbitmq-test; make clear-resource-alarm SOURCE=disk").

@@ -10,13 +10,13 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2011 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(negative_test_util).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -compile(export_all).
@@ -151,7 +151,7 @@ command_invalid_over_channel_test() ->
     case amqp_connection:info(Connection, [type]) of
         [{type, direct}]  -> Channel ! {send_command, #'connection.open'{}};
         [{type, network}] -> gen_server:cast(Channel,
-                                 {method, #'connection.open'{}, none})
+                                 {method, #'connection.open'{}, none, noflow})
     end,
     assert_down_with_error(MonitorRef, command_invalid),
     ?assertNot(is_process_alive(Channel)),
@@ -162,7 +162,7 @@ command_invalid_over_channel_test() ->
 %% command_invalid - this only applies to the network case
 command_invalid_over_channel0_test() ->
     {ok, Connection} = test_util:new_connection(just_network),
-    gen_server:cast(Connection, {method, #'basic.ack'{}, none}),
+    gen_server:cast(Connection, {method, #'basic.ack'{}, none, noflow}),
     MonitorRef = erlang:monitor(process, Connection),
     assert_down_with_error(MonitorRef, command_invalid),
     ok.
@@ -182,8 +182,7 @@ non_existent_user_test() ->
 
 invalid_password_test() ->
     Params = [{username, <<"guest">>}, {password, test_util:uuid()}],
-    ?assertMatch({error, auth_failure},
-                 test_util:new_connection(just_network, Params)).
+    ?assertMatch({error, auth_failure}, test_util:new_connection(Params)).
 
 non_existent_vhost_test() ->
     Params = [{virtual_host, test_util:uuid()}],

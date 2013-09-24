@@ -10,20 +10,21 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2011 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @private
 -module(amqp_gen_connection).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
 -behaviour(gen_server).
 
 -export([start_link/5, connect/1, open_channel/3, hard_error_in_channel/3,
          channel_internal_error/3, server_misbehaved/2, channels_terminated/1,
-         close/2, info/2, info_keys/0, info_keys/1]).
+         close/3, server_close/2, info/2, info_keys/0, info_keys/1,
+         register_blocked_handler/2]).
 -export([behaviour_info/1]).
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
          handle_info/2]).
@@ -40,6 +41,8 @@
                 server_properties,
                 start_infrastructure_fun,
                 start_channels_manager_fun,
+                %% connection.block, connection.unblock handler
+                block_handler,
                 closing = false %% #closing{} | false
                }).
 
@@ -80,8 +83,11 @@ server_misbehaved(Pid, AmqpError) ->
 channels_terminated(Pid) ->
     gen_server:cast(Pid, channels_terminated).
 
-close(Pid, Close) ->
-    gen_server:call(Pid, {command, {close, Close}}, infinity).
+close(Pid, Close, Timeout) ->
+    gen_server:call(Pid, {command, {close, Close, Timeout}}, infinity).
+
+server_close(Pid, Close) ->
+    gen_server:cast(Pid, {server_close, Close}).
 
 info(Pid, Items) ->
     gen_server:call(Pid, {info, Items}, infinity).
@@ -151,13 +157,18 @@ callback(Function, Params, State = #state{module = Mod,
 %%---------------------------------------------------------------------------
 
 init([Mod, Sup, AmqpParams, SIF, SChMF, ExtraParams]) ->
+    %% Trapping exits since we need to make sure that the `terminate/2' is
+    %% called in the case of direct connection (it does not matter for a network
+    %% connection).  See bug25116.
+    process_flag(trap_exit, true),
     {ok, MState} = Mod:init(ExtraParams),
     {ok, #state{module = Mod,
                 module_state = MState,
                 sup = Sup,
                 amqp_params = AmqpParams,
                 start_infrastructure_fun = SIF,
-                start_channels_manager_fun = SChMF}}.
+                start_channels_manager_fun = SChMF,
+                block_handler = none}}.
 
 handle_call(connect, _From,
             State0 = #state{module = Mod,
@@ -176,10 +187,10 @@ handle_call(connect, _From,
         {error, _} = Error ->
             {stop, {shutdown, Error}, Error, State0}
     end;
-handle_call({command, Command}, From, State = #state{closing = Closing}) ->
-    case Closing of false -> handle_command(Command, From, State);
-                    _     -> {reply, closing, State}
-    end;
+handle_call({command, Command}, From, State = #state{closing = false}) ->
+    handle_command(Command, From, State);
+handle_call({command, _Command}, _From, State) ->
+    {reply, closing, State};
 handle_call({info, Items}, _From, State) ->
     {reply, [{Item, i(Item, State)} || Item <- Items], State};
 handle_call(info_keys, _From, State = #state{module = Mod}) ->
@@ -195,7 +206,7 @@ after_connect({ServerProperties, ChannelMax, NewMState},
                 channel_max       = ChannelMax,
                 module_state      = NewMState}.
 
-handle_cast({method, Method, none}, State) ->
+handle_cast({method, Method, none, noflow}, State) ->
     handle_method(Method, State);
 handle_cast(channels_terminated, State) ->
     handle_channels_terminated(State);
@@ -206,8 +217,19 @@ handle_cast({channel_internal_error, Pid, Reason}, State) ->
               [self(), Pid, Reason]),
     internal_error(State);
 handle_cast({server_misbehaved, AmqpError}, State) ->
-    server_misbehaved_close(AmqpError, State).
+    server_misbehaved_close(AmqpError, State);
+handle_cast({server_close, #'connection.close'{} = Close}, State) ->
+    server_initiated_close(Close, State);
+handle_cast({register_blocked_handler, HandlerPid}, State) ->
+    Ref = erlang:monitor(process, HandlerPid),
+    {noreply, State#state{block_handler = {HandlerPid, Ref}}}.
 
+%% @private
+handle_info({'DOWN', _, process, BlockHandler, Reason},
+            State = #state{block_handler = {BlockHandler, _Ref}}) ->
+    ?LOG_WARN("Connection (~p): Unregistering block handler ~p because it died. "
+              "Reason: ~p~n", [self(), BlockHandler, Reason]),
+    {noreply, State#state{block_handler = none}};
 handle_info(Info, State) ->
     callback(handle_message, [Info], State).
 
@@ -215,7 +237,7 @@ terminate(Reason, #state{module = Mod, module_state = MState}) ->
     Mod:terminate(Reason, MState).
 
 code_change(_OldVsn, State, _Extra) ->
-    State.
+    {ok, State}.
 
 %%---------------------------------------------------------------------------
 %% Infos
@@ -230,6 +252,13 @@ i(num_channels,      State) -> amqp_channels_manager:num_channels(
 i(Item, #state{module = Mod, module_state = MState}) -> Mod:i(Item, MState).
 
 %%---------------------------------------------------------------------------
+%% connection.blocked, connection.unblocked
+%%---------------------------------------------------------------------------
+
+register_blocked_handler(Pid, HandlerPid) ->
+    gen_server:cast(Pid, {register_blocked_handler, HandlerPid}).
+
+%%---------------------------------------------------------------------------
 %% Command handling
 %%---------------------------------------------------------------------------
 
@@ -240,8 +269,8 @@ handle_command({open_channel, ProposedNumber, Consumer}, _From,
     {reply, amqp_channels_manager:open_channel(ChMgr, ProposedNumber, Consumer,
                                                Mod:open_channel_args(MState)),
      State};
-handle_command({close, #'connection.close'{} = Close}, From, State) ->
-     app_initiated_close(Close, From, State).
+handle_command({close, #'connection.close'{} = Close, Timeout}, From, State) ->
+    app_initiated_close(Close, From, Timeout, State).
 
 %%---------------------------------------------------------------------------
 %% Handling methods from broker
@@ -254,6 +283,16 @@ handle_method(#'connection.close_ok'{}, State = #state{closing = Closing}) ->
                     #closing{from = From} -> gen_server:reply(From, ok)
     end,
     {stop, {shutdown, closing_to_reason(Closing)}, State};
+handle_method(#'connection.blocked'{} = Blocked, State = #state{block_handler = BlockHandler}) ->
+    case BlockHandler of none        -> ok;
+                         {Pid, _Ref} -> Pid ! Blocked
+    end,
+    {noreply, State};
+handle_method(#'connection.unblocked'{} = Unblocked, State = #state{block_handler = BlockHandler}) ->
+    case BlockHandler of none        -> ok;
+                         {Pid, _Ref} -> Pid ! Unblocked
+    end,
+    {noreply, State};
 handle_method(Other, State) ->
     server_misbehaved_close(#amqp_error{name        = command_invalid,
                                         explanation = "unexpected method on "
@@ -265,7 +304,11 @@ handle_method(Other, State) ->
 %% Closing
 %%---------------------------------------------------------------------------
 
-app_initiated_close(Close, From, State) ->
+app_initiated_close(Close, From, Timeout, State) ->
+    case Timeout of
+        infinity -> ok;
+        _        -> erlang:send_after(Timeout, self(), closing_timeout)
+    end,
     set_closing_state(flush, #closing{reason = app_initiated_close,
                                       close = Close,
                                       from = From}, State).

@@ -10,15 +10,15 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2011 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(amqp_uri).
 
 -include("amqp_client.hrl").
 
--export([parse/1]).
+-export([parse/1, parse/2]).
 
 %%---------------------------------------------------------------------------
 %% AMQP URI Parsing
@@ -34,15 +34,19 @@
 %% default values are used.  If the hostname is zero-length, an
 %% #amqp_params_direct{} record is returned; otherwise, an
 %% #amqp_params_network{} record is returned.  Extra parameters may be
-%% specified via the query string (e.g. "?heartbeat=5"). In case of
-%% failure, an {error, {Info, Uri}} tuple is returned.
+%% specified via the query string
+%% (e.g. "?heartbeat=5&amp;auth_mechanism=external"). In case of failure,
+%% an {error, {Info, Uri}} tuple is returned.
 %%
 %% The extra parameters that may be specified are channel_max,
-%% frame_max, and heartbeat.  The extra parameters that may be
-%% specified for an SSL connection are cacertfile, certfile, keyfile,
-%% verify, and fail_if_no_peer_cert.
-parse(Uri) ->
-    try case parse1(Uri) of
+%% frame_max, heartbeat and auth_mechanism (the latter can appear more
+%% than once).  The extra parameters that may be specified for an SSL
+%% connection are cacertfile, certfile, keyfile, verify, and
+%% fail_if_no_peer_cert.
+parse(Uri) -> parse(Uri, <<"/">>).
+
+parse(Uri, DefaultVHost) ->
+    try case parse1(Uri, DefaultVHost) of
             {ok, #amqp_params_network{host         = undefined,
                                       username     = User,
                                       virtual_host = Vhost}} ->
@@ -55,7 +59,7 @@ parse(Uri) ->
           error:Err -> {error, {Err, Uri}}
     end.
 
-parse1(Uri) when is_list(Uri) ->
+parse1(Uri, DefaultVHost) when is_list(Uri) ->
     case uri_parser:parse(Uri, [{host, undefined}, {path, undefined},
                                 {port, undefined}, {'query', []}]) of
         {error, Err} ->
@@ -63,13 +67,13 @@ parse1(Uri) when is_list(Uri) ->
         Parsed ->
             Endpoint =
                 case string:to_lower(proplists:get_value(scheme, Parsed)) of
-                    "amqp"  -> build_broker(Parsed);
-                    "amqps" -> build_ssl_broker(Parsed);
+                    "amqp"  -> build_broker(Parsed, DefaultVHost);
+                    "amqps" -> build_ssl_broker(Parsed, DefaultVHost);
                     Scheme  -> fail({unexpected_uri_scheme, Scheme})
                 end,
             return({ok, broker_add_query(Endpoint, Parsed)})
     end;
-parse1(_) ->
+parse1(_, _DefaultVHost) ->
     fail(expected_string_uri).
 
 unescape_string(Atom) when is_atom(Atom) ->
@@ -87,7 +91,7 @@ unescape_string([$% | Rest]) ->
 unescape_string([C | Rest]) ->
     [C | unescape_string(Rest)].
 
-build_broker(ParsedUri) ->
+build_broker(ParsedUri, DefaultVHost) ->
     [Host, Port, Path] =
         [proplists:get_value(F, ParsedUri) || F <- [host, port, path]],
     case Port =:= undefined orelse (0 < Port andalso Port =< 65535) of
@@ -95,16 +99,17 @@ build_broker(ParsedUri) ->
         false -> fail({port_out_of_range, Port})
     end,
     VHost = case Path of
-                undefined -> <<"/">>;
+                undefined -> DefaultVHost;
                 [$/|Rest] -> case string:chr(Rest, $/) of
                                  0 -> list_to_binary(unescape_string(Rest));
                                  _ -> fail({invalid_vhost, Rest})
                              end
             end,
     UserInfo = proplists:get_value(userinfo, ParsedUri),
-    Ps = #amqp_params_network{host         = unescape_string(Host),
-                              port         = Port,
-                              virtual_host = VHost},
+    Ps = #amqp_params_network{host            = unescape_string(Host),
+                              port            = Port,
+                              virtual_host    = VHost,
+                              auth_mechanisms = mechanisms(ParsedUri)},
     case UserInfo of
         [U, P | _] -> Ps#amqp_params_network{
                         username = list_to_binary(unescape_string(U)),
@@ -114,8 +119,8 @@ build_broker(ParsedUri) ->
         _          -> Ps
     end.
 
-build_ssl_broker(ParsedUri) ->
-    Params = build_broker(ParsedUri),
+build_ssl_broker(ParsedUri, DefaultVHost) ->
+    Params = build_broker(ParsedUri, DefaultVHost),
     Query = proplists:get_value('query', ParsedUri),
     SSLOptions =
         run_state_monad(
@@ -167,9 +172,10 @@ broker_add_query(Params, ParsedUri, Fields) ->
            end || Field <- Fields], {Params, 2}),
     Params1.
 
-parse_amqp_param(Field, String) when Field =:= channel_max orelse
-                                     Field =:= frame_max   orelse
-                                     Field =:= heartbeat   ->
+parse_amqp_param(Field, String) when Field =:= channel_max        orelse
+                                     Field =:= frame_max          orelse
+                                     Field =:= heartbeat          orelse
+                                     Field =:= connection_timeout ->
     try return(list_to_integer(String))
     catch error:badarg -> fail({not_an_integer, String})
     end;
@@ -185,8 +191,19 @@ find_boolean_parameter(Value) ->
         false -> fail({require_boolean, Bool})
     end.
 
-find_atom_parameter(Value) ->
-    return(list_to_atom(Value)).
+find_atom_parameter(Value) -> return(list_to_atom(Value)).
+
+mechanisms(ParsedUri) ->
+    Query = proplists:get_value('query', ParsedUri),
+    Mechanisms = case proplists:get_all_values("auth_mechanism", Query) of
+                     []    -> ["plain", "amqplain"];
+                     Mechs -> Mechs
+                 end,
+    [case [list_to_atom(T) || T <- string:tokens(Mech, ":")] of
+         [F]    -> fun (R, P, S) -> amqp_auth_mechanisms:F(R, P, S) end;
+         [M, F] -> fun (R, P, S) -> M:F(R, P, S) end;
+         L      -> throw({not_mechanism, L})
+     end || Mech <- Mechanisms].
 
 %% --=: Plain state monad implementation start :=--
 run_state_monad(FunList, State) ->

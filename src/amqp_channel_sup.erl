@@ -10,14 +10,14 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2011 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @private
 -module(amqp_channel_sup).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
 -behaviour(supervisor2).
 
@@ -44,22 +44,23 @@ start_link(Type, Connection, InfraArgs, ChNumber, Consumer = {_, _}) ->
 %% Internal plumbing
 %%---------------------------------------------------------------------------
 
-start_writer_fun(_Sup, direct, [ConnectionPid, Node, User, VHost, Collector],
+start_writer_fun(_Sup, direct, [ConnPid, ConnName, Node, User, VHost,
+                                Collector],
                  ChNumber) ->
     fun () ->
             {ok, RabbitCh} =
                 rpc:call(Node, rabbit_direct, start_channel,
-                         [ChNumber, self(), ConnectionPid, ?PROTOCOL, User,
+                         [ChNumber, self(), ConnPid, ConnName, ?PROTOCOL, User,
                           VHost, ?CLIENT_CAPABILITIES, Collector]),
             link(RabbitCh),
             {ok, RabbitCh}
     end;
-start_writer_fun(Sup, network, [Sock], ChNumber) ->
+start_writer_fun(Sup, network, [Sock, FrameMax], ChNumber) ->
     fun () ->
             {ok, _} = supervisor2:start_child(
                         Sup,
                         {writer, {rabbit_writer, start_link,
-                                  [Sock, ChNumber, ?FRAME_MIN_SIZE, ?PROTOCOL,
+                                  [Sock, ChNumber, FrameMax, ?PROTOCOL,
                                    self()]},
                          intrinsic, ?MAX_WAIT, worker, [rabbit_writer]})
     end.

@@ -10,8 +10,8 @@
 #
 # The Original Code is RabbitMQ.
 #
-# The Initial Developer of the Original Code is VMware, Inc.
-# Copyright (c) 2007-2011 VMware, Inc.  All rights reserved.
+# The Initial Developer of the Original Code is GoPivotal, Inc.
+# Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
 #
 
 VERSION=0.0.0
@@ -25,6 +25,8 @@ BROKER_DEPS=$(BROKER_HEADERS) $(BROKER_SOURCES)
 
 INFILES=$(shell find . -name '*.app.in')
 INTARGETS=$(patsubst %.in, %, $(INFILES))
+
+WEB_URL=http://www.rabbitmq.com/
 
 include common.mk
 
@@ -65,7 +67,7 @@ $(DOC_DIR)/overview.edoc: $(SOURCE_DIR)/overview.edoc.in
 	sed -e 's:%%VERSION%%:$(VERSION):g' < $< > $@
 
 $(DOC_DIR)/index.html: $(DEPS_DIR)/$(COMMON_PACKAGE_DIR) $(DOC_DIR)/overview.edoc $(SOURCES)
-	$(LIBS_PATH) erl -noshell -eval 'edoc:application(amqp_client, ".", [{preprocess, true}])' -run init stop
+	$(LIBS_PATH) erl -noshell -eval 'edoc:application(amqp_client, ".", [{preprocess, true}, {macros, [{edoc, true}]}])' -run init stop
 
 ###############################################################################
 ##  Testing
@@ -103,7 +105,8 @@ $(DIST_DIR)/$(COMMON_PACKAGE_EZ): $(BROKER_DEPS) $(COMMON_PACKAGE).app | $(DIST_
 source_tarball: $(DIST_DIR)/$(COMMON_PACKAGE_EZ) $(EBIN_DIR)/$(PACKAGE).app | $(DIST_DIR)
 	mkdir -p $(DIST_DIR)/$(SOURCE_PACKAGE_DIR)/$(DIST_DIR)
 	$(COPY) $(DIST_DIR)/$(COMMON_PACKAGE_EZ) $(DIST_DIR)/$(SOURCE_PACKAGE_DIR)/$(DIST_DIR)/
-	$(COPY) README $(DIST_DIR)/$(SOURCE_PACKAGE_DIR)/
+	$(COPY) README.in $(DIST_DIR)/$(SOURCE_PACKAGE_DIR)/README
+	elinks -dump -no-references -no-numbering $(WEB_URL)build-erlang-client.html >> $(DIST_DIR)/$(SOURCE_PACKAGE_DIR)/README
 	$(COPY) common.mk $(DIST_DIR)/$(SOURCE_PACKAGE_DIR)/
 	$(COPY) test.mk $(DIST_DIR)/$(SOURCE_PACKAGE_DIR)/
 	sed 's/%%VSN%%/$(VERSION)/' Makefile.in > $(DIST_DIR)/$(SOURCE_PACKAGE_DIR)/Makefile

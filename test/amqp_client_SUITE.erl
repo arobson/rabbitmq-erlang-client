@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2011 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(amqp_client_SUITE).
@@ -37,10 +37,11 @@
 %%---------------------------------------------------------------------------
 
 amqp_uri_parse_test_()                  -> ?RUN([]).
+route_destination_test_()               -> ?RUN([]).
 basic_get_test_()                       -> ?RUN([]).
 basic_get_ipv6_test_()                  -> ?RUN([]).
 basic_return_test_()                    -> ?RUN([]).
-simultaneous_close_test_()              -> ?RUN([repeat, {timeout, 60}]).
+simultaneous_close_test_()              -> ?RUN([repeat]).
 basic_qos_test_()                       -> ?RUN([]).
 basic_recover_test_()                   -> ?RUN([]).
 basic_consume_test_()                   -> ?RUN([]).
@@ -48,6 +49,7 @@ consume_notification_test_()            -> ?RUN([]).
 basic_nack_test_()                      -> ?RUN([]).
 large_content_test_()                   -> ?RUN([]).
 lifecycle_test_()                       -> ?RUN([]).
+direct_no_password_test_()              -> ?RUN([]).
 nowait_exchange_declare_test_()         -> ?RUN([]).
 channel_repeat_open_close_test_()       -> ?RUN([]).
 channel_multi_open_close_test_()        -> ?RUN([]).
@@ -55,22 +57,26 @@ basic_ack_test_()                       -> ?RUN([]).
 basic_ack_call_test_()                  -> ?RUN([]).
 channel_lifecycle_test_()               -> ?RUN([]).
 queue_unbind_test_()                    -> ?RUN([]).
-sync_method_serialization_test_()       -> ?RUN([{timeout, 60}]).
-async_sync_method_serialization_test_() -> ?RUN([{timeout, 60}]).
-sync_async_method_serialization_test_() -> ?RUN([{timeout, 60}]).
-teardown_test_()                        -> ?RUN([repeat, {timeout, 60}]).
+sync_method_serialization_test_()       -> ?RUN([]).
+async_sync_method_serialization_test_() -> ?RUN([]).
+sync_async_method_serialization_test_() -> ?RUN([]).
+teardown_test_()                        -> ?RUN([repeat]).
 rpc_test_()                             -> ?RUN([]).
-pub_and_close_test_()                   -> ?RUN([{timeout, 60}]).
+rpc_client_test_()                      -> ?RUN([]).
+pub_and_close_test_()                   -> ?RUN([]).
 channel_tune_negotiation_test_()        -> ?RUN([]).
 confirm_test_()                         -> ?RUN([]).
 confirm_barrier_test_()                 -> ?RUN([]).
-confirm_barrier_nop_test_()             -> ?RUN([]).
-default_consumer_test()                 -> ?RUN([]).
+confirm_select_before_wait_test_()      -> ?RUN([]).
+confirm_barrier_timeout_test_()         -> ?RUN([]).
+confirm_barrier_die_timeout_test_()     -> ?RUN([]).
+default_consumer_test_()                -> ?RUN([]).
 subscribe_nowait_test_()                -> ?RUN([]).
+connection_blocked_network_test_()      -> ?RUN([]).
 
 non_existent_exchange_test_()           -> ?RUN([negative]).
-bogus_rpc_test_()                    -> ?RUN([negative, repeat, {timeout, 60}]).
-hard_error_test_()                   -> ?RUN([negative, repeat, {timeout, 60}]).
+bogus_rpc_test_()                    -> ?RUN([negative, repeat]).
+hard_error_test_()                   -> ?RUN([negative, repeat]).
 non_existent_user_test_()               -> ?RUN([negative]).
 invalid_password_test_()                -> ?RUN([negative]).
 non_existent_vhost_test_()              -> ?RUN([negative]).
@@ -96,7 +102,7 @@ run(TestName, Props) ->
                  true  -> negative_test_util;
                  false -> test_util
              end,
-    {timeout, proplists:get_value(timeout, Props, 5),
+    {timeout, proplists:get_value(timeout, Props, 60),
      fun () ->
              lists:foreach(
                  fun (_) ->
@@ -116,4 +122,3 @@ test_coverage() ->
     rabbit_misc:enable_cover(),
     test(),
     rabbit_misc:report_cover().
-
